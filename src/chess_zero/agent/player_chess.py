@@ -160,8 +160,53 @@ class ChessPlayer:
         vals = [f.result() for f in futures]
 
         return np.max(vals), vals[0] # vals[0] is kind of racy
+    
+    def search_my_move_explicit(self, env, is_root_node=False):
+        if env.done:
+            if env.winner == Winner.draw:
+                return 0,[]
+            # assert env.whitewon != env.white_to_move # side to move can't be winner!
+            return -1,[]
 
-    def search_my_move(self, env: ChessEnv, is_root_node=False) -> float:
+        state = state_key(env)
+
+        with self.node_lock[state]:
+            if state not in self.tree:
+                leaf_p, leaf_v = self.expand_and_evaluate(env)
+                self.tree[state].p = leaf_p
+                return leaf_v, [] # I'm returning everything from the POV of side to move
+
+            # SELECT STEP
+            action_t = self.select_action_q_and_u(env, is_root_node)
+
+            virtual_loss = self.play_config.virtual_loss
+
+            my_visit_stats = self.tree[state]
+            my_stats = my_visit_stats.a[action_t]
+
+            my_visit_stats.sum_n += virtual_loss
+            my_stats.n += virtual_loss
+            my_stats.w += -virtual_loss
+            my_stats.q = my_stats.w / my_stats.n
+
+        move = action_t.uci()
+        env.step(move)
+        next_state = state_key(env)
+        leaf_v, next_sequence = self.search_my_move_explicit(env)  # next move from enemy POV
+        leaf_v = -leaf_v
+
+        # BACKUP STEP
+        # on returning search path
+        # update: N, W, Q
+        with self.node_lock[state]:
+            my_visit_stats.sum_n += -virtual_loss + 1
+            my_stats.n += -virtual_loss + 1
+            my_stats.w += virtual_loss + leaf_v
+            my_stats.q = my_stats.w / my_stats.n
+
+        return leaf_v, [next_state] + next_sequence
+
+    def search_my_move(self, env: ChessEnv, is_root_node=False, depth=0) -> float:
         """
         Q, V is value for this Player(always white).
         P is value for the player of next_player (black or white)
@@ -201,8 +246,9 @@ class ChessPlayer:
             my_stats.w += -virtual_loss
             my_stats.q = my_stats.w / my_stats.n
 
+        print("SMM state", 'd{}'.format(depth), state, action_t)
         env.step(action_t.uci())
-        leaf_v = self.search_my_move(env)  # next move from enemy POV
+        leaf_v = self.search_my_move(env, depth=depth+1)  # next move from enemy POV
         leaf_v = -leaf_v
 
         # BACKUP STEP
@@ -241,10 +287,10 @@ class ChessPlayer:
         :return (float,float): policy (prior probability of taking the action leading to this state)
             and value network (value of the state) prediction for this state.
         """
-        pipe = self.pipe_pool.pop()
-        pipe.send(state_planes)
-        ret = pipe.recv()
-        self.pipe_pool.append(pipe)
+        pipes = self.pipe_pool.pop()
+        pipes[0].send(state_planes)
+        ret = pipes[0].recv()
+        self.pipe_pool.append(pipes)
         return ret
 
     #@profile
